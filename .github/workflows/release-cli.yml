@@ -1,0 +1,261 @@
+name: Release CLI
+
+on:
+  push:
+    branches: [release/cli]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  # ── Job 1: Extract version from csproj ──────────────────────────────
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Extract version
+        id: version
+        run: |
+          CSPROJ="src/PortainerLogs/PortainerLogs.csproj"
+          RAW_VERSION=$(grep -oP '(?<=<Version>)[^<]+' "$CSPROJ")
+
+          # Split into base version and optional pre-release suffix
+          BASE=$(echo "$RAW_VERSION" | grep -oP '^[0-9]+\.[0-9]+\.[0-9]+')
+          SUFFIX=$(echo "$RAW_VERSION" | grep -oP '[-].+$' || true)
+
+          # Extract major.minor, use run_number as patch
+          MAJOR_MINOR=$(echo "$BASE" | grep -oP '^[0-9]+\.[0-9]+')
+          FULL_VERSION="${MAJOR_MINOR}.${{ github.run_number }}${SUFFIX}"
+
+          echo "version=$FULL_VERSION" >> $GITHUB_OUTPUT
+          echo "Version: $FULL_VERSION"
+
+  # ── Job 2: Build and test ───────────────────────────────────────────
+  build-test:
+    needs: version
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Restore dependencies
+        run: dotnet restore
+
+      - name: Build
+        run: dotnet build --no-restore --configuration Release -p:Version=${{ env.VERSION }}
+
+      - name: Test
+        run: |
+          dotnet test tests/PortainerLogs.Tests \
+            --no-build \
+            --configuration Release \
+            --verbosity normal
+
+  # ── Job 3: Build native binaries (matrix across 6 platforms) ────────
+  build-native:
+    needs: [version, build-test]
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - runner: windows-latest
+            rid: win-x64
+            archive: zip
+          - runner: windows-latest
+            rid: win-arm64
+            archive: zip
+          - runner: ubuntu-latest
+            rid: linux-x64
+            archive: tar.gz
+          - runner: ubuntu-latest
+            rid: linux-arm64
+            archive: tar.gz
+          - runner: macos-latest
+            rid: osx-x64
+            archive: tar.gz
+          - runner: macos-latest
+            rid: osx-arm64
+            archive: tar.gz
+
+    runs-on: ${{ matrix.runner }}
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Publish self-contained binary
+        run: >
+          dotnet publish src/PortainerLogs
+          --configuration Release
+          --runtime ${{ matrix.rid }}
+          --self-contained true
+          -p:PublishSingleFile=true
+          -p:PublishTrimmed=true
+          -p:TrimMode=partial
+          -p:Version=${{ env.VERSION }}
+          --output ./publish
+
+      - name: Create archive (tar.gz)
+        if: matrix.archive == 'tar.gz'
+        run: tar -czf portainer-logs-${{ env.VERSION }}-${{ matrix.rid }}.tar.gz -C ./publish .
+
+      - name: Create archive (zip)
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: Compress-Archive -Path ./publish/* -DestinationPath portainer-logs-${{ env.VERSION }}-${{ matrix.rid }}.zip
+
+      - name: Generate checksum (Linux/macOS)
+        if: matrix.archive == 'tar.gz'
+        run: sha256sum portainer-logs-${{ env.VERSION }}-${{ matrix.rid }}.tar.gz > portainer-logs-${{ env.VERSION }}-${{ matrix.rid }}.tar.gz.sha256
+
+      - name: Generate checksum (Windows)
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          $hash = (Get-FileHash -Algorithm SHA256 "portainer-logs-${{ env.VERSION }}-${{ matrix.rid }}.zip").Hash.ToLower()
+          "$hash  portainer-logs-${{ env.VERSION }}-${{ matrix.rid }}.zip" | Out-File -Encoding ascii "portainer-logs-${{ env.VERSION }}-${{ matrix.rid }}.zip.sha256"
+
+      - name: Upload archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: portainer-logs-${{ matrix.rid }}
+          path: |
+            portainer-logs-${{ env.VERSION }}-${{ matrix.rid }}.*
+
+  # ── Job 4: Build NuGet package ──────────────────────────────────────
+  build-nuget:
+    needs: [version, build-test]
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Restore dependencies
+        run: dotnet restore src/PortainerLogs
+
+      - name: Build
+        run: dotnet build src/PortainerLogs --no-restore --configuration Release -p:Version=${{ env.VERSION }}
+
+      - name: Pack
+        run: dotnet pack src/PortainerLogs --no-build --configuration Release --output ./nupkg -p:PackageVersion=${{ env.VERSION }}
+
+      - name: Upload NuGet package
+        uses: actions/upload-artifact@v4
+        with:
+          name: nuget-package
+          path: ./nupkg/*.nupkg
+
+  # ── Job 5: Publish release (all-or-nothing) ────────────────────────
+  release:
+    needs: [version, build-native, build-nuget]
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: ./artifacts
+
+      - name: Push NuGet package
+        run: dotnet nuget push ./artifacts/nuget-package/*.nupkg --api-key ${{ secrets.NUGET_API_KEY }} --source https://api.nuget.org/v3/index.json --skip-duplicate
+
+      - name: Create git tag
+        run: |
+          git tag "v${{ env.VERSION }}"
+          git push origin "v${{ env.VERSION }}"
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Collect all archives and checksums into a flat directory
+          mkdir -p release-assets
+          find ./artifacts -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.sha256' \) -exec cp {} release-assets/ \;
+
+          # Build release notes
+          cat > release-notes.md << 'NOTES'
+          ## portainer-logs v${{ env.VERSION }}
+
+          ### Installation
+
+          **NuGet (.NET global tool — requires .NET 10):**
+          ```bash
+          dotnet tool install --global PortainerLogs --version ${{ env.VERSION }}
+          ```
+
+          **Standalone binaries (no .NET required):**
+
+          | Platform | Architecture | Download |
+          |----------|-------------|----------|
+          | Windows | x64 | `portainer-logs-${{ env.VERSION }}-win-x64.zip` |
+          | Windows | ARM64 | `portainer-logs-${{ env.VERSION }}-win-arm64.zip` |
+          | Linux | x64 | `portainer-logs-${{ env.VERSION }}-linux-x64.tar.gz` |
+          | Linux | ARM64 | `portainer-logs-${{ env.VERSION }}-linux-arm64.tar.gz` |
+          | macOS | x64 (Intel) | `portainer-logs-${{ env.VERSION }}-osx-x64.tar.gz` |
+          | macOS | ARM64 (Apple Silicon) | `portainer-logs-${{ env.VERSION }}-osx-arm64.tar.gz` |
+
+          ### Verify checksums
+          Each archive has a corresponding `.sha256` file. Verify with:
+          ```bash
+          sha256sum -c portainer-logs-${{ env.VERSION }}-<rid>.tar.gz.sha256
+          ```
+
+          ### NuGet
+          https://www.nuget.org/packages/PortainerLogs/${{ env.VERSION }}
+          NOTES
+
+          gh release create "v${{ env.VERSION }}" \
+            --title "portainer-logs v${{ env.VERSION }}" \
+            --notes-file release-notes.md \
+            release-assets/*
+
+      - name: Job summary
+        run: |
+          echo "## PortainerLogs Release" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Version:** \`${{ env.VERSION }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Tag:** \`v${{ env.VERSION }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**NuGet:** https://www.nuget.org/packages/PortainerLogs/${{ env.VERSION }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Native Binaries" >> $GITHUB_STEP_SUMMARY
+          echo "| Platform | RID |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-----|" >> $GITHUB_STEP_SUMMARY
+          echo "| Windows x64 | win-x64 |" >> $GITHUB_STEP_SUMMARY
+          echo "| Windows ARM64 | win-arm64 |" >> $GITHUB_STEP_SUMMARY
+          echo "| Linux x64 | linux-x64 |" >> $GITHUB_STEP_SUMMARY
+          echo "| Linux ARM64 | linux-arm64 |" >> $GITHUB_STEP_SUMMARY
+          echo "| macOS x64 | osx-x64 |" >> $GITHUB_STEP_SUMMARY
+          echo "| macOS ARM64 | osx-arm64 |" >> $GITHUB_STEP_SUMMARY
