@@ -112,6 +112,13 @@ portainer-logs containers --format json | jq '.[].name'
 portainer-logs logs myapp --format json | jq '.[] | select(.stream == "stderr")'
 ```
 
+## Using with Claude Code
+
+`portainer-logs` is designed to work as a subprocess for AI coding assistants. There are two ways to integrate it with Claude Code:
+
+- **[Passive awareness](docs/claude-code-passive.md)** — Add an entry to your `CLAUDE.md` so Claude Code knows about the tool in every session and can reach for it when container issues come up.
+- **[Diagnostic skill](docs/claude-code-skill.md)** — Create a `/diagnose-containers` slash command that runs a structured triage workflow on demand.
+
 ## License
 
 [BSD 3-Clause](LICENSE)
